@@ -1,0 +1,222 @@
+#include "lwip/init.h"
+#include "lwip/sys.h"
+#include "lwip/mem.h"
+#include "lwip/memp.h"
+#include "lwip/pbuf.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+#include "lwip/netif.h"
+#include "lwip/stats.h"
+#include "lwip/sockets.h"
+#include <byteswap.h>
+#include "netif/ibvif.h"
+#include <time.h>
+#include <sys/time.h>
+#include "lwip/stats.h"
+#include <signal.h>
+
+#define MAX_CLIENT_PER_THREAD 300
+#define MAX_THREAD 50
+#define PORT 80 
+#define MAX_CLIENT_BUFFER 256
+/*#define DEBUG*/
+
+int listenfd;
+
+typedef struct {
+	pthread_t tid;
+	int fd_max;
+	fd_set read_set;
+	int client_count;
+	int clients[MAX_CLIENT_PER_THREAD];
+	struct sockaddr_in cliaddr[MAX_CLIENT_PER_THREAD];
+} Thread;
+
+pthread_mutex_t new_connection_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+Thread threads[MAX_THREAD];
+
+void nonblock(int sockfd)
+{
+	int opts, ret;
+	opts = lwip_fcntl(sockfd, F_GETFL, ret);
+	if(opts < 0)
+	{
+		perror("fcntl(F_GETFL)\n");
+		exit(1);
+	}
+	opts = (opts | O_NONBLOCK);
+	if(lwip_fcntl(sockfd, F_SETFL, opts) < 0) 
+	{
+		perror("fcntl(F_SETFL)\n");
+		exit(1);
+	}
+}
+
+void *thread_init_func(void *arg)
+{
+        int tid = (int *)arg;
+	
+	int readsocks;
+	int i;
+	char buffer[MAX_CLIENT_BUFFER];
+	char c;
+	int n;
+	socklen_t clilen;
+	lwip_thread_aff(0);
+#ifdef DEBUG
+	printf("thread %d created\n", tid);
+	printf("sizeof thread.clients: %d\n", sizeof(threads[tid].clients));
+#endif
+	memset((int *) &threads[tid].clients, 0, sizeof(threads[tid].clients));
+	memset((char *) &buffer, 0, sizeof(buffer));	
+        sleep(2);
+	while(1)
+	{
+#ifdef DEBUG
+		printf("thread %d running, client count: %d\n", tid, threads[tid].client_count);
+		sleep(3);
+#endif
+                if (threads[tid].client_count == 0) sleep(1);
+		//for(i = 1; i <= MAX_CLIENT_PER_THREAD; i++)
+		//{
+			if(threads[tid].clients[0] != 0)
+			{
+                                clilen = sizeof(threads[tid].cliaddr[i]);
+				n = lwip_recv(threads[tid].clients[i], buffer, MAX_CLIENT_BUFFER, 0);
+				if(n == 0)
+				{
+#ifdef DEBUG
+					printf("client %d closed connection 0\n", threads[tid].clients[i]);
+#endif
+					pthread_mutex_lock(&new_connection_mutex);
+					threads[tid].clients[i] = 0;
+					threads[tid].client_count--;
+                                        //FD_CLR(i, &threads[tid].read_set);
+					memset((char *) &buffer, 0, strlen(buffer));
+					pthread_mutex_unlock(&new_connection_mutex);
+				} else {
+#ifdef DEBUG
+					printf("%d bytes received from %d - %s\n", n, threads[tid].clients[i], buffer);
+#endif
+					
+					lwip_send(threads[tid].clients[i], buffer, strlen(buffer), 0);
+					memset((char *) &buffer, 0, strlen(buffer));
+				}
+			}
+		//}
+	}
+}
+
+int choose_thread()
+{
+	int i=MAX_THREAD-1;
+	int min = 0;
+	while(i > -1)
+	{
+		if(threads[i].client_count < threads[i-1].client_count)
+		{
+			min = i;
+			break;
+		}
+		i--;
+	}		
+	return min;
+}
+
+int main(int argc, char**argv)
+{
+	char c;
+	struct sockaddr_in srv, cli;
+	int clifd;
+	socklen_t clilen;
+	int tid;
+	int i;
+	int choosen;
+	int flag = 1, result;
+
+ 	lwip_thread_aff(0);
+ 	tcpip_init(NULL, NULL);
+
+	signal(SIGPIPE, SIG_IGN);
+	
+	if( (listenfd = lwip_socket(AF_INET, SOCK_STREAM, 0)) < 0)
+	{
+		perror("sockfd\n");
+		exit(1);
+	}
+	bzero(&srv, sizeof(srv));
+	srv.sin_family = AF_INET;
+	srv.sin_addr.s_addr = inet_addr(argv[1]);
+	srv.sin_port = bswap_16(PORT);
+
+	if(lwip_bind(listenfd, (struct sockaddr *) &srv, sizeof(srv)) < 0)
+	{
+		perror("bind\n");
+		exit(1);
+	}
+	
+	lwip_listen(listenfd, 1024);
+
+	
+	/* create threads  */
+	for(i = 0; i < MAX_THREAD; i++)
+	{
+		pthread_create(&threads[i].tid, NULL, &thread_init_func, (void *) i);
+		threads[i].client_count = 0;
+                threads[i].fd_max = 0;
+		FD_ZERO(&threads[i].read_set);
+	}
+	
+
+	for( ; ; )
+	{
+		clifd = lwip_accept(listenfd, (struct sockaddr *)&cli, &clilen);
+		//nonblock(clifd);
+   		result = lwip_setsockopt(clifd,     /* socket affected */
+                           		 IPPROTO_TCP,    /* set option at TCP level */
+                           		 TCP_NODELAY,    /* name of option */
+                           		 (char *) &flag, /* cast is historical cruft */
+                           		 sizeof(int));   /* length of option value */
+
+		pthread_mutex_lock(&new_connection_mutex);
+		
+		choosen = choose_thread();
+
+		for(i = 0; i <= MAX_CLIENT_PER_THREAD; i++)
+		{
+			if(threads[choosen].clients[i] == 0)
+			{
+#ifdef DEBUG
+				printf("before threads clifd\n");
+#endif
+				threads[choosen].clients[i] = clifd;
+				/*threads[choosen].cliaddr[i] = cli;*/
+#ifdef DEBUG
+				printf("after threads clifd\n");
+#endif
+				threads[choosen].client_count++;
+				break;
+			}
+		}
+
+#ifdef DEBUG
+		printf("choosen: %d\n", choosen);
+
+		for(i = 0; i < MAX_THREAD; i++)
+		{
+			printf("threads[%d].client_count:%d\n", i, threads[i].client_count);
+		}
+#endif
+
+		pthread_mutex_unlock(&new_connection_mutex);
+	}
+
+	if(errno)
+	{
+		printf("errno: %d", errno);
+	}
+	
+	return 0;
+}

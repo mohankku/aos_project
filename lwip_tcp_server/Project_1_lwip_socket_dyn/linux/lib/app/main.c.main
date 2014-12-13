@@ -1,0 +1,153 @@
+#include "lwip/init.h"
+#include "lwip/sys.h"
+#include "lwip/mem.h"
+#include "lwip/memp.h"
+#include "lwip/pbuf.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+#include "lwip/netif.h"
+#include "lwip/stats.h"
+#include "lwip/sockets.h"
+#include <byteswap.h>
+#include "netif/ibvif.h"
+#include <time.h>
+#include <sys/time.h>
+#include "lwip/stats.h"
+#include <signal.h>
+#include "lwip/sample_tracepoint.h"
+
+struct thread_struct {
+   int cpu;
+   int    connfd;
+   struct sockaddr_in cliaddr;
+};
+
+void print_stats (int sig)
+{
+   //stats_display();
+   exit(1);
+}
+
+void *
+server_handle_client_conn(void *arg)
+{
+   struct thread_struct t_data = *(struct thread_struct *)arg;
+   socklen_t clilen;
+   char mesg[1000];
+   clilen = sizeof(t_data.cliaddr);
+   int n;
+   int flag = 1;
+   lwip_thread_aff(t_data.cpu);
+   pthread_yield();
+   int result = lwip_setsockopt(t_data.connfd,   /* socket affected */
+                           IPPROTO_TCP,     /* set option at TCP level */
+                           TCP_NODELAY,     /* name of option */
+                           (char *) &flag,  /* the cast is historical cruft */
+                           sizeof(int));    /* length of option value */
+   if (result < 0) {
+       printf("couldn't disable nagle\n");
+   }
+   for(;;) {
+          //n = lwip_recvfrom(t_data.connfd,mesg,1000,0,(struct sockaddr *)&t_data.cliaddr,&clilen);
+          n = lwip_recvfrom(t_data.connfd,mesg,100,0,NULL,NULL);
+	  //tracepoint(sample_tracepoint, message, "Application received packet\n");
+          if ((n==0) || (n == -1)) {
+             printf("recv error\n");
+             break;
+          }
+          //lwip_sendto(t_data.connfd,mesg,n,0,(struct sockaddr *)&t_data.cliaddr,sizeof(t_data.cliaddr));
+   }
+   close(t_data.connfd);
+}
+
+void *
+handle_listener (void *arg) {
+  int cpu = *(int *) arg;
+  int listenfd, connfd;
+  struct sockaddr_in servaddr, cliaddr;
+  struct thread_struct thread_data[1000];
+  socklen_t clilen;
+  pid_t     childpid;
+  pthread_t tmp;
+  int index;
+
+  lwip_thread_aff(cpu);
+  pthread_yield();
+  listenfd = lwip_socket(AF_INET,SOCK_STREAM,0);
+  memset(&servaddr,0,sizeof(struct sockaddr_in));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr=inet_addr("10.0.0.1");
+  servaddr.sin_port=bswap_16(80);
+  lwip_bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+  lwip_listen(listenfd, 1024);
+  index = 0;
+  for(;;)
+  {
+    clilen = sizeof(cliaddr);
+    connfd = lwip_accept(listenfd,(struct sockaddr *)&cliaddr,&clilen);
+    thread_data[index].connfd = connfd;
+    thread_data[index].cliaddr = cliaddr;
+    thread_data[index].cpu = cpu;
+
+    pthread_create(&tmp, NULL, (void *(*)(void *)) server_handle_client_conn, (void *)&thread_data[index]);
+    index++;
+  }
+  close(listenfd);
+}
+
+int main(int argc, char**argv) {
+ int listenfd, connfd;
+ struct sockaddr_in servaddr, cliaddr;
+ struct thread_struct thread_data[1000];
+ socklen_t clilen;
+ pid_t     childpid;
+ u32_t     n;
+ struct timespec start;
+ int code, i, index;
+ pthread_t tmp;
+ int cpus[NUM_CPU];
+ pthread_attr_t attr;
+ struct sched_param param = {
+     .sched_priority = 9
+ };
+ 
+ lwip_thread_aff(0);
+ pthread_yield();
+ tcpip_init(NULL, NULL);
+
+ /*for (i=1; i<NUM_CPU ; i++) {
+   cpus[i] = i;
+   pthread_create(&tmp, NULL, (void *(*)(void *)) handle_listener, (void *) &cpus[i]);
+ }*/
+ 
+ index = 0;
+
+ listenfd = lwip_socket(AF_INET,SOCK_STREAM,0);
+ memset(&servaddr,0,sizeof(struct sockaddr_in));
+ servaddr.sin_family = AF_INET;
+ servaddr.sin_addr.s_addr=inet_addr(argv[1]);
+ servaddr.sin_port=bswap_16(80);
+ lwip_bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+ lwip_listen(listenfd, 1024);
+ //signal(SIGINT, print_stats);
+
+ for(;;)
+ {
+    clilen = sizeof(cliaddr);
+    connfd = lwip_accept(listenfd,(struct sockaddr *)&cliaddr,&clilen);
+    if (!connfd) {
+      continue;
+    }
+    thread_data[index].connfd = connfd;
+    thread_data[index].cliaddr = cliaddr;
+    thread_data[index].cpu = 12;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr, &param);
+
+    pthread_create(&tmp, NULL, (void *(*)(void *)) server_handle_client_conn, (void *)&thread_data[index]);
+    index++;
+ }
+ close(listenfd);
+}

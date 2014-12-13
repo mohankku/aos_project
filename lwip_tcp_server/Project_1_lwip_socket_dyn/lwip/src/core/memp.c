@@ -1,0 +1,570 @@
+/**
+ * @file
+ * Dynamic pool memory manager
+ *
+ * lwIP has dedicated pools for many structures (netconn, protocol control blocks,
+ * packet buffers, ...). All these pools are managed here.
+ */
+
+/*
+ * Copyright (c) 2001-2004 Swedish Institute of Computer Science.
+ * All rights reserved. 
+ * 
+ * Redistribution and use in source and binary forms, with or without modification, 
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ * 3. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission. 
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED 
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF 
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT 
+ * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, 
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT 
+ * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING 
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY 
+ * OF SUCH DAMAGE.
+ *
+ * This file is part of the lwIP TCP/IP stack.
+ * 
+ * Author: Adam Dunkels <adam@sics.se>
+ *
+ */
+
+#include "lwip/opt.h"
+
+#include "lwip/memp.h"
+#include "lwip/pbuf.h"
+#include "lwip/tcp_impl.h"
+#include "lwip/igmp.h"
+#include "lwip/api.h"
+#include "lwip/api_msg.h"
+#include "lwip/tcpip.h"
+#include "lwip/sys.h"
+#include "lwip/timers.h"
+#include "lwip/stats.h"
+#include "netif/etharp.h"
+#include "lwip/ip_frag.h"
+#include "lwip/snmp_structs.h"
+#include "lwip/snmp_msg.h"
+
+#include <string.h>
+#include <pthread.h>
+#include <sys/mman.h>
+
+#if !MEMP_MEM_MALLOC /* don't build if not configured for use in lwipopts.h */
+
+#if MEMP_OVERFLOW_CHECK
+/* if MEMP_OVERFLOW_CHECK is turned on, we reserve some bytes at the beginning
+ * and at the end of each element, initialize them as 0xcd and check
+ * them later. */
+/* If MEMP_OVERFLOW_CHECK is >= 2, on every call to memp_malloc or memp_free,
+ * every single element in each pool is checked!
+ * This is VERY SLOW but also very helpful. */
+/* MEMP_SANITY_REGION_BEFORE and MEMP_SANITY_REGION_AFTER can be overridden in
+ * lwipopts.h to change the amount reserved for checking. */
+#ifndef MEMP_SANITY_REGION_BEFORE
+#define MEMP_SANITY_REGION_BEFORE  16
+#endif /* MEMP_SANITY_REGION_BEFORE*/
+#if MEMP_SANITY_REGION_BEFORE > 0
+#define MEMP_SANITY_REGION_BEFORE_ALIGNED    LWIP_MEM_ALIGN_SIZE(MEMP_SANITY_REGION_BEFORE)
+#else
+#define MEMP_SANITY_REGION_BEFORE_ALIGNED    0
+#endif /* MEMP_SANITY_REGION_BEFORE*/
+#ifndef MEMP_SANITY_REGION_AFTER
+#define MEMP_SANITY_REGION_AFTER   16
+#endif /* MEMP_SANITY_REGION_AFTER*/
+#if MEMP_SANITY_REGION_AFTER > 0
+#define MEMP_SANITY_REGION_AFTER_ALIGNED     LWIP_MEM_ALIGN_SIZE(MEMP_SANITY_REGION_AFTER)
+#else
+#define MEMP_SANITY_REGION_AFTER_ALIGNED     0
+#endif /* MEMP_SANITY_REGION_AFTER*/
+
+/* MEMP_SIZE: save space for struct memp and for sanity check */
+#define MEMP_SIZE          (LWIP_MEM_ALIGN_SIZE(sizeof(struct memp)) + MEMP_SANITY_REGION_BEFORE_ALIGNED)
+#define MEMP_ALIGN_SIZE(x) (LWIP_MEM_ALIGN_SIZE(x) + MEMP_SANITY_REGION_AFTER_ALIGNED)
+
+#else /* MEMP_OVERFLOW_CHECK */
+
+/* No sanity checks
+ * We don't need to preserve the struct memp while not allocated, so we
+ * can save a little space and set MEMP_SIZE to 0.
+ */
+#define MEMP_SIZE           0
+#define MEMP_ALIGN_SIZE(x) (LWIP_MEM_ALIGN_SIZE(x))
+
+#endif /* MEMP_OVERFLOW_CHECK */
+
+/** This array holds the first free element of each pool.
+ *  Elements form a linked list. */
+static struct memp *memp_tab[MEMP_MAX];
+
+#else /* MEMP_MEM_MALLOC */
+
+#define MEMP_ALIGN_SIZE(x) (LWIP_MEM_ALIGN_SIZE(x))
+
+#endif /* MEMP_MEM_MALLOC */
+
+/** This array holds the element sizes of each pool. */
+#if !MEM_USE_POOLS && !MEMP_MEM_MALLOC
+static
+#endif
+const u16_t memp_sizes[MEMP_MAX] = {
+#define LWIP_MEMPOOL(name,num,size,desc)  LWIP_MEM_ALIGN_SIZE(size),
+#include "lwip/memp_std.h"
+};
+
+#if !MEMP_MEM_MALLOC /* don't build if not configured for use in lwipopts.h */
+
+/** This array holds the number of elements in each pool. */
+static const u32_t memp_num[MEMP_MAX] = {
+#define LWIP_MEMPOOL(name,num,size,desc)  (num),
+#include "lwip/memp_std.h"
+};
+
+/** This array holds a textual description of each pool. */
+#ifdef LWIP_DEBUG
+static const char *memp_desc[MEMP_MAX] = {
+#define LWIP_MEMPOOL(name,num,size,desc)  (desc),
+#include "lwip/memp_std.h"
+};
+#endif /* LWIP_DEBUG */
+
+#if MEMP_SEPARATE_POOLS
+
+/** This creates each memory pool. These are named memp_memory_XXX_base (where
+ * XXX is the name of the pool defined in memp_std.h).
+ * To relocate a pool, declare it as extern in cc.h. Example for GCC:
+ *   extern u8_t __attribute__((section(".onchip_mem"))) memp_memory_UDP_PCB_base[];
+ */
+#define LWIP_MEMPOOL(name,num,size,desc) u8_t memp_memory_ ## name ## _base \
+  [((num) * (MEMP_SIZE + MEMP_ALIGN_SIZE(size)))];   
+#include "lwip/memp_std.h"
+
+/** This array holds the base of each memory pool. */
+static u8_t *const memp_bases[] = { 
+#define LWIP_MEMPOOL(name,num,size,desc) memp_memory_ ## name ## _base,   
+#include "lwip/memp_std.h"
+};
+
+#else /* MEMP_SEPARATE_POOLS */
+
+/** This is the actual memory used by the pools (all pools in one big block). */
+static u8_t memp_memory[MEM_ALIGNMENT - 1 
+#define LWIP_MEMPOOL(name,num,size,desc) + ( (num) * (MEMP_SIZE + MEMP_ALIGN_SIZE(size) ) )
+#include "lwip/memp_std.h"
+];
+
+#endif /* MEMP_SEPARATE_POOLS */
+
+#if MEMP_SANITY_CHECK
+/**
+ * Check that memp-lists don't form a circle
+ */
+static int
+memp_sanity(void)
+{
+  s16_t i, c;
+  struct memp *m, *n;
+
+  for (i = 0; i < MEMP_MAX; i++) {
+    for (m = memp_tab[i]; m != NULL; m = m->next) {
+      c = 1;
+      for (n = memp_tab[i]; n != NULL; n = n->next) {
+        if (n == m && --c < 0) {
+          return 0;
+        }
+      }
+    }
+  }
+  return 1;
+}
+#endif /* MEMP_SANITY_CHECK*/
+#if MEMP_OVERFLOW_CHECK
+#if defined(LWIP_DEBUG) && MEMP_STATS
+static const char * memp_overflow_names[] = {
+#define LWIP_MEMPOOL(name,num,size,desc) "/"desc,
+#include "lwip/memp_std.h"
+  };
+#endif
+
+/**
+ * Check if a memp element was victim of an overflow
+ * (e.g. the restricted area after it has been altered)
+ *
+ * @param p the memp element to check
+ * @param memp_type the pool p comes from
+ */
+static void
+memp_overflow_check_element_overflow(struct memp *p, u16_t memp_type)
+{
+  u16_t k;
+  u8_t *m;
+#if MEMP_SANITY_REGION_AFTER_ALIGNED > 0
+  m = (u8_t*)p + MEMP_SIZE + memp_sizes[memp_type];
+  for (k = 0; k < MEMP_SANITY_REGION_AFTER_ALIGNED; k++) {
+    if (m[k] != 0xcd) {
+      char errstr[128] = "detected memp overflow in pool ";
+      char digit[] = "0";
+      if(memp_type >= 10) {
+        digit[0] = '0' + (memp_type/10);
+        strcat(errstr, digit);
+      }
+      digit[0] = '0' + (memp_type%10);
+      strcat(errstr, digit);
+#if defined(LWIP_DEBUG) && MEMP_STATS
+      strcat(errstr, memp_overflow_names[memp_type]);
+#endif
+      LWIP_ASSERT(errstr, 0);
+    }
+  }
+#endif
+}
+
+/**
+ * Check if a memp element was victim of an underflow
+ * (e.g. the restricted area before it has been altered)
+ *
+ * @param p the memp element to check
+ * @param memp_type the pool p comes from
+ */
+static void
+memp_overflow_check_element_underflow(struct memp *p, u16_t memp_type)
+{
+  u16_t k;
+  u8_t *m;
+#if MEMP_SANITY_REGION_BEFORE_ALIGNED > 0
+  m = (u8_t*)p + MEMP_SIZE - MEMP_SANITY_REGION_BEFORE_ALIGNED;
+  for (k = 0; k < MEMP_SANITY_REGION_BEFORE_ALIGNED; k++) {
+    if (m[k] != 0xcd) {
+      char errstr[128] = "detected memp underflow in pool ";
+      char digit[] = "0";
+      if(memp_type >= 10) {
+        digit[0] = '0' + (memp_type/10);
+        strcat(errstr, digit);
+      }
+      digit[0] = '0' + (memp_type%10);
+      strcat(errstr, digit);
+#if defined(LWIP_DEBUG) && MEMP_STATS
+      strcat(errstr, memp_overflow_names[memp_type]);
+#endif
+      LWIP_ASSERT(errstr, 0);
+    }
+  }
+#endif
+}
+
+/**
+ * Do an overflow check for all elements in every pool.
+ *
+ * @see memp_overflow_check_element for a description of the check
+ */
+static void
+memp_overflow_check_all(void)
+{
+  u16_t i, j;
+  struct memp *p;
+
+  p = (struct memp *)LWIP_MEM_ALIGN(memp_memory);
+  for (i = 0; i < MEMP_MAX; ++i) {
+    p = p;
+    for (j = 0; j < memp_num[i]; ++j) {
+      memp_overflow_check_element_overflow(p, i);
+      p = (struct memp*)((u8_t*)p + MEMP_SIZE + memp_sizes[i] + MEMP_SANITY_REGION_AFTER_ALIGNED);
+    }
+  }
+  p = (struct memp *)LWIP_MEM_ALIGN(memp_memory);
+  for (i = 0; i < MEMP_MAX; ++i) {
+    p = p;
+    for (j = 0; j < memp_num[i]; ++j) {
+      memp_overflow_check_element_underflow(p, i);
+      p = (struct memp*)((u8_t*)p + MEMP_SIZE + memp_sizes[i] + MEMP_SANITY_REGION_AFTER_ALIGNED);
+    }
+  }
+}
+
+/**
+ * Initialize the restricted areas of all memp elements in every pool.
+ */
+static void
+memp_overflow_init(void)
+{
+  u16_t i, j;
+  struct memp *p;
+  u8_t *m;
+
+  p = (struct memp *)LWIP_MEM_ALIGN(memp_memory);
+  for (i = 0; i < MEMP_MAX; ++i) {
+    p = p;
+    for (j = 0; j < memp_num[i]; ++j) {
+#if MEMP_SANITY_REGION_BEFORE_ALIGNED > 0
+      m = (u8_t*)p + MEMP_SIZE - MEMP_SANITY_REGION_BEFORE_ALIGNED;
+      memset(m, 0xcd, MEMP_SANITY_REGION_BEFORE_ALIGNED);
+#endif
+#if MEMP_SANITY_REGION_AFTER_ALIGNED > 0
+      m = (u8_t*)p + MEMP_SIZE + memp_sizes[i];
+      memset(m, 0xcd, MEMP_SANITY_REGION_AFTER_ALIGNED);
+#endif
+      p = (struct memp*)((u8_t*)p + MEMP_SIZE + memp_sizes[i] + MEMP_SANITY_REGION_AFTER_ALIGNED);
+    }
+  }
+}
+#endif /* MEMP_OVERFLOW_CHECK */
+
+#define HUGE_PAGE_SIZE (2 * 1024 * 1024)
+#define ALIGN_TO_PAGE_SIZE(x) \
+(((x) + HUGE_PAGE_SIZE - 1) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE)
+
+void *malloc_huge_pages(size_t size)
+{
+  // Use 1 extra page to store allocation metadata
+  // (libhugetlbfs is more efficient in this regard)
+  size_t real_size = ALIGN_TO_PAGE_SIZE(size + HUGE_PAGE_SIZE);
+  char *ptr = (char *)mmap(NULL, real_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGETLB,
+                           -1, 0);
+
+  if (ptr == MAP_FAILED) {
+    // The mmap() call failed. Try to malloc instead
+    ptr = (char *)malloc(real_size);
+    if (ptr == NULL) return NULL;
+    real_size = 0;
+  }
+
+  // Save real_size since mmunmap() requires a size parameter
+
+  *((size_t *)ptr) = real_size;
+
+  // Skip the page with metadata
+  return ptr + HUGE_PAGE_SIZE;
+}
+
+int
+memp_alloc_tx_pbuf(struct tcpip_thread *thread)
+{
+  struct pbuf_handle *c_buf;
+  long long size;
+
+  memset(&thread->pbuf_tx_handle, 0, sizeof(thread->pbuf_tx_handle));
+  c_buf = &thread->pbuf_tx_handle;
+
+  size = sizeof(struct pbuf) * PBUF_POOL_SIZE;
+  c_buf->info = (struct pbuf *)malloc_huge_pages(size);
+
+  if (!c_buf->info)
+    return -1;
+
+  size = TCP_MAX_PACKET_SIZE * PBUF_POOL_SIZE;
+  c_buf->buf = malloc_huge_pages(size);
+
+  if (!c_buf->buf)
+    return -1;
+
+  c_buf->lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+
+  c_buf->cnt = 0;
+  c_buf->next_to_use = 0;
+  c_buf->next_to_send = 0;
+  c_buf->next_offset = 0;
+
+  if (pthread_mutex_init(c_buf->lock, NULL)) {
+     return -1;
+  }
+
+  return 0;
+}
+
+int
+memp_alloc_rx_pbuf(struct tcpip_thread *thread)
+{
+  struct pbuf_handle *c_buf;
+  long long size;
+
+  memset(&thread->pbuf_rx_handle, 0, sizeof(thread->pbuf_rx_handle));
+  c_buf = &thread->pbuf_rx_handle;
+
+  size = sizeof(struct pbuf) * PBUF_POOL_SIZE;
+  c_buf->info = (struct pbuf *)malloc_huge_pages(size);
+
+  if (!c_buf->info)
+    return -1;
+
+  size = TCP_MAX_PACKET_SIZE * PBUF_POOL_SIZE;
+  c_buf->buf = malloc_huge_pages(size);
+
+  if (!c_buf->buf)
+    return -1;
+
+  c_buf->lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+
+  c_buf->cnt = 0;
+  c_buf->next_to_use = 0;
+  c_buf->next_to_send = 0;
+  c_buf->next_offset = 0;
+
+  if (pthread_mutex_init(c_buf->lock, NULL)) {
+     return -1;
+  }
+
+  return 0;
+}
+
+/**
+ * Initialize this module.
+ *
+ * Carves out memp_memory into linked lists for each pool-type.
+ */
+void
+memp_init(void)
+{
+  struct memp *memp;
+  u32_t i, j;
+  u64_t total_size=0;
+  char cpu = sched_getcpu();
+
+  for (i = 0; i < MEMP_MAX; ++i) {
+    total_size += (memp_num[i] * (MEMP_SIZE + memp_sizes[i]));
+  }
+  memp = malloc_huge_pages(total_size);
+
+  /* for every pool: */
+  for (i = 0; i < MEMP_MAX; ++i) {
+    lwip_tcpip_thread[cpu]->memp_tab[i] = NULL;
+    /* create a linked list of memp elements */
+    for (j = 0; j < memp_num[i]; ++j) {
+      memp->next = lwip_tcpip_thread[cpu]->memp_tab[i];
+      lwip_tcpip_thread[cpu]->memp_tab[i] = memp;
+      memp = (struct memp *)(void *)((u8_t *)memp + MEMP_SIZE + memp_sizes[i]);
+    }
+  }
+  memp_alloc_rx_pbuf(lwip_tcpip_thread[cpu]);
+  memp_alloc_tx_pbuf(lwip_tcpip_thread[cpu]);
+}
+
+void *
+memp_malloc_rx(struct tcpip_thread *thread) {
+  struct pbuf_handle *c_buf;
+  struct pbuf *p;
+  int w_idx;
+  void *x;
+
+  c_buf = &thread->pbuf_rx_handle;
+
+  pthread_mutex_lock(c_buf->lock);
+  w_idx = c_buf->next_to_use;
+  p = &c_buf->info[w_idx];
+  if (p->ref)
+    return NULL;
+  c_buf->cnt++;
+  c_buf->next_to_use = (w_idx + 1) % PBUF_POOL_SIZE;
+
+  pthread_mutex_unlock(c_buf->lock);
+  return ((void *) p);
+}
+
+void *
+memp_malloc_tx(struct tcpip_thread *thread) {
+  struct pbuf_handle *c_buf;
+  struct pbuf *p;
+  int w_idx;
+  void *x;
+
+  c_buf = &thread->pbuf_tx_handle;
+
+  pthread_mutex_lock(c_buf->lock);
+  w_idx = c_buf->next_to_use;
+  p = &c_buf->info[w_idx];
+  p->payload = c_buf->buf + c_buf->next_offset;
+  c_buf->next_offset += TCP_MAX_PACKET_SIZE;
+  if (p->ref)
+    return NULL;
+  c_buf->cnt++;
+  c_buf->next_to_use = (w_idx + 1) % PBUF_POOL_SIZE;
+
+  if(c_buf->next_to_use == 0)
+    c_buf->next_offset = 0;
+
+  pthread_mutex_unlock(c_buf->lock);
+  return ((void *) p);
+}
+
+/** * Get an element from a specific pool.  *
+ * @param type the pool to get an element from
+ *
+ * the debug version has two more parameters:
+ * @param file file name calling this function
+ * @param line number of line where this function is called
+ *
+ * @return a pointer to the allocated memory or a NULL pointer on error
+ */
+void *
+memp_malloc(memp_t type, struct tcpip_thread *thread)
+{
+  struct memp *memp;
+  char cpu;
+
+  if (!thread) {
+    cpu = sched_getcpu();
+    thread = lwip_tcpip_thread[cpu];
+  }
+
+  LWIP_ERROR("memp_malloc: type < MEMP_MAX", (type < MEMP_MAX), return NULL;);
+
+  pthread_mutex_lock(&thread->mem_mutex[type]);
+
+  memp = thread->memp_tab[type];
+
+  if (memp != NULL) {
+    thread->memp_tab[type] = memp->next;
+    LWIP_ASSERT("memp_malloc: memp properly aligned",
+                ((mem_ptr_t)memp % MEM_ALIGNMENT) == 0);
+    memp = (struct memp*)(void *)((u8_t*)memp + MEMP_SIZE);
+  } else {
+    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: out of memory in pool %s\n", memp_desc[type]));
+  }
+
+  pthread_mutex_unlock(&thread->mem_mutex[type]);
+  return memp;
+}
+
+/**
+ * Put an element back into its pool.
+ *
+ * @param type the pool where to put mem
+ * @param mem the memp element to free
+ */
+void
+memp_free(memp_t type, void *mem, struct tcpip_thread *thread)
+{
+  struct memp *memp;
+  char cpu;
+
+  if (!thread) {
+    cpu = sched_getcpu();
+    thread = lwip_tcpip_thread[cpu];
+  }
+
+  if (mem == NULL) {
+    return;
+  }
+  LWIP_ASSERT("memp_free: mem properly aligned",
+                ((mem_ptr_t)mem % MEM_ALIGNMENT) == 0);
+
+  memp = (struct memp *)(void *)((u8_t*)mem - MEMP_SIZE);
+
+  pthread_mutex_lock(&thread->mem_mutex[type]);
+
+  memp->next = thread->memp_tab[type];
+  thread->memp_tab[type] = memp;
+
+  pthread_mutex_unlock(&thread->mem_mutex[type]);
+}
+
+#endif /* MEMP_MEM_MALLOC */
